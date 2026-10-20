@@ -26,6 +26,11 @@ MAV_RESULT AC_DroneShowManager::handle_command_int_packet(const mavlink_command_
         //     bits in future versions and sacrifice higher group indices.
         //     param7 of the command is remapped to param1 of the injected command,
         //     while param7 in the injected command is always zero.
+        // 4 = set input source of LED light. param2 is the index of the light to
+        //     update (must be 0 at the moment as we only support one light).
+        //     param3 is the type of the input source (0 = fixed color, 1 = show,
+        //     2 = interactive pixel grid). param5 (x) is the RGB color of the light
+        //     if fixed mode is set, otherwise ignored.
         if (is_zero(packet.param1)) {
             // Reload current show
             if (reload_or_clear_show(/* do_clear = */ 0)) {
@@ -86,6 +91,33 @@ MAV_RESULT AC_DroneShowManager::handle_command_int_packet(const mavlink_command_
             } else {
                 return MAV_RESULT_ACCEPTED;
             }
+        } else if (is_equal(packet.param1, 4.0f)) {
+            // Set input source of LED light
+            if (!is_equal(packet.param2, 0.0f)) {
+                // We only support one light at the moment, so the index must be zero
+                return MAV_RESULT_UNSUPPORTED;
+            } else if (is_equal(packet.param3, 0.0f)) {
+                // Fixed color
+                // param5 (x) is the RGB color of the light
+                sb_rgb_color_t fixed_color = sb_rgb_color_make(
+                    static_cast<uint8_t>((packet.x >> 16) & 0xFF),
+                    static_cast<uint8_t>((packet.x >> 8) & 0xFF),
+                    static_cast<uint8_t>(packet.x & 0xFF)
+                );
+                _rgb_led_input.set_type(LightInputSource_Fixed);
+                _rgb_led_input.set_fixed_color(fixed_color);
+                return MAV_RESULT_ACCEPTED;
+            } else if (is_equal(packet.param3, 1.0f)) {
+                // Color from the light program
+                _rgb_led_input.set_type(LightInputSource_Show);
+                return MAV_RESULT_ACCEPTED;
+            } else if (is_equal(packet.param3, 2.0f)) {
+                // Interactive pixel grid
+                _rgb_led_input.set_type(LightInputSource_PixelGrid);
+                return MAV_RESULT_ACCEPTED;
+            } else {
+                return MAV_RESULT_FAILED;
+            }
         }
 
         // Unsupported command code
@@ -101,7 +133,7 @@ MAV_RESULT AC_DroneShowManager::handle_command_int_packet(const mavlink_command_
             // do not want to lose precision in the lat/lng direction due to
             // float representation
             //
-            // param4: orientation
+            // param4: orientation, must be between 0 and 360 degrees, -1 if unset
             // param5 (x): latitude (degE7)
             // param6 (y): longitude (degE7)
             // param7 (z): AMSL (mm)
@@ -154,6 +186,12 @@ bool AC_DroneShowManager::handle_message(mavlink_channel_t chan, const mavlink_m
             // GCS module.
             return _handle_led_control_message(msg);
 
+        case MAVLINK_MSG_ID_TUNNEL:
+            // Tunnel packets are used to pipe interactive GCS-based LED control
+            // commands to the drone. (LED_CONTROL is not enough because its payload
+            // is too small).
+            return _handle_tunnel_message(msg);
+
         default:
             return false;
     }
@@ -201,7 +239,8 @@ bool AC_DroneShowManager::_handle_custom_data_message(mavlink_channel_t chan, ui
             handled = _handle_acknowledgment_packet(data, length);
             break;
 
-        // Time axis configuration packet, used to implement suspension and resume
+        // Time axis configuration packet, used to implement suspension, resume and
+        // collective RTH
         case CustomPackets::TIME_AXIS_CONFIG:
             handled = _handle_time_axis_configuration_packet(data, length);
             break;
@@ -591,6 +630,30 @@ bool AC_DroneShowManager::_handle_time_axis_configuration_packet(void* data, uin
                 // show clock because the clock of the new RTH scene starts from 0
                 rth_plan_entry.time_sec = 0.0f;
     
+                // If the drone is configured to adjust for takeoff placement errors
+                // AND it is flying back to its takeoff position during CRTH, we need
+                // to adjust the indicated end coordinates of the RTH plan
+                // to account for the takeoff placement error.
+                if (
+                    _trajectory_is_circular &&
+                    _trajectory_modified_for_landing &&
+                    (rth_plan_entry.flags & SB_RTH_PLAN_ENTRY_HAS_TARGET_XY)
+                ) {
+                    float dist_mm = hypotf(
+                        rth_plan_entry.landing_target.x - _trajectory_stats.initial_pos.x,
+                        rth_plan_entry.landing_target.y - _trajectory_stats.initial_pos.y
+                    );
+                    if (dist_mm / 1000.0f /* [mm] --> [m] */ < DEFAULT_START_END_XY_DISTANCE_THRESHOLD_METERS) {
+                        // The landing target is very close to the initial position of the
+                        // trajectory, so we assume that the RTH plan is meant to land at
+                        // the takeoff position. We know the X and Y coordinates of the
+                        // takeoff position from _trajectory_stats, which has been adjusted
+                        // at takeoff time
+                        rth_plan_entry.landing_target.x = _trajectory_stats.pos_at_landing_time.x;
+                        rth_plan_entry.landing_target.y = _trajectory_stats.pos_at_landing_time.y;
+                    }
+                }
+
                 if (sb_trajectory_update_from_rth_plan_entry(rth_trajectory, &rth_plan_entry, start) != SB_SUCCESS) {
                     // Could not create RTH plan trajectory
                     sb_trajectory_player_destroy(&player);
@@ -649,6 +712,11 @@ bool AC_DroneShowManager::_handle_time_axis_configuration_packet(void* data, uin
             ptr += sizeof(CustomPackets::time_axis_config_scene_entry_t);
     
             if (entry->duration_msec == 0) {
+                // This is a special segment that indicates that the duration of the
+                // scene is dynamic and depends on the trajectory. We need to set a
+                // flag on the scene to indicate this, and calculate the actual duration
+                // of the segment based on the trajectory itself.
+                sb_screenplay_scene_set_flag(scene, SB_SCREENPLAY_SCENE_FLAG_DYNAMIC_DURATION);
                 if (!_ensure_scene_covers_relevant_part_of_trajectory(
                     scene, entry->initial_rate_scaled / 65535.0f,
                     entry->final_rate_scaled / 65535.0f
